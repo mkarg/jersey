@@ -43,6 +43,46 @@ public class NettyClientProperties {
 
     /**
      * <p>
+     *     A boolean value that defines, if the HTTP/2 protocol should be used to communicate with the server.
+     * </p>
+     * <p>
+     *     When the property is {@code true}, the connector uses the HTTP/2 protocol: for the HTTPS uri scheme,
+     *     the protocol is negotiated by the TLS ALPN (with the fallback to the HTTP/1.1 protocol, if the server does
+     *     not support the HTTP/2); for the HTTP uri scheme, the HTTP/2 prior knowledge (the cleartext HTTP/2, i.e. h2c)
+     *     is used, which requires the server to support the cleartext HTTP/2.
+     * </p>
+     * <p>
+     *     The default value is {@code false} and the HTTP/1.1 protocol is used.
+     * </p>
+     * <p>
+     *     The name of the configuration property is <tt>{@value}</tt>.
+     * </p>
+     * @since 4.x
+     */
+    public static final String ENABLE_HTTP2 = "jersey.config.client.netty.enableHttp2";
+
+    /**
+     * <p>
+     *     The maximal length of the content of the HTTP/2 response aggregated by the Netty connector, in bytes.
+     * </p>
+     * <p>
+     *     The name of the configuration property is <tt>{@value}</tt>.
+     * </p>
+     * @since 4.x
+     */
+    public static final String MAX_HTTP2_CONTENT_LENGTH = "jersey.config.client.netty.maxHttp2ContentLength";
+
+    /**
+     * The default value of MAX_HTTP2_CONTENT_LENGTH.
+     * <p/>
+     * The value is used only when the HTTP/2 protocol is used.
+     *
+     * @since 4.x
+     */
+    public static final Integer DEFAULT_HTTP2_CONTENT_LENGTH_VALUE = Integer.MAX_VALUE;
+
+    /**
+     * <p>
      *     Filter the HTTP headers for requests (CONNECT) towards the proxy except for PROXY-prefixed and HOST headers when {@code true}.
      * </p>
      * <p>
