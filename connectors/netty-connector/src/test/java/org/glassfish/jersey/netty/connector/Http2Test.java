@@ -210,7 +210,7 @@ public class Http2Test {
      * once the read timeout elapses, instead of waiting for the connect timeout (which is unbounded when unset).
      */
     @Test
-    public void testReadTimeoutDuringHttpsHandshake() {
+    public void testReadTimeoutDuringHttpsHandshake() throws InterruptedException {
         // a server that accepts connections but never speaks TLS
         final NioEventLoopGroup silentGroup = new NioEventLoopGroup(1);
         Channel silentServer = null;
