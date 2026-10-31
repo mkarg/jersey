@@ -18,7 +18,10 @@ package org.glassfish.jersey.netty.connector;
 
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import jakarta.ws.rs.ProcessingException;
 import jakarta.ws.rs.client.Client;
@@ -54,6 +57,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 
 /**
@@ -63,6 +67,7 @@ public class Http2Test {
 
     private static final String GET_RESPONSE = "Hello World!";
     private static final String POST_RESPONSE = "Posted!";
+    private static final String SLOW_RESPONSE = "0123456789";
 
     private Channel serverChannel;
     private NioEventLoopGroup serverGroup;
@@ -102,7 +107,7 @@ public class Http2Test {
     private static final class Http2ServerStreamHandler extends SimpleChannelInboundHandler<Object> {
 
         @Override
-        protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
+        protected void channelRead0(final ChannelHandlerContext ctx, final Object msg) {
             if (!(msg instanceof Http2HeadersFrame)) {
                 return;
             }
@@ -110,7 +115,8 @@ public class Http2Test {
             final Http2Headers headers = headersFrame.headers();
 
             final boolean isPost = "POST".contentEquals(headers.method());
-            final String body = isPost ? POST_RESPONSE : GET_RESPONSE;
+            final boolean isSlow = String.valueOf(headers.path()).contains("/slow");
+            final String body = isPost ? POST_RESPONSE : isSlow ? SLOW_RESPONSE : GET_RESPONSE;
 
             final Http2Headers response = new DefaultHttp2Headers()
                     .status("200")
@@ -118,8 +124,27 @@ public class Http2Test {
                     .set("x-http2-echo-method", String.valueOf(headers.method()));
 
             ctx.write(new DefaultHttp2HeadersFrame(response, false));
-            final ByteBuf content = Unpooled.wrappedBuffer(body.getBytes(StandardCharsets.UTF_8));
-            ctx.write(new DefaultHttp2DataFrame(content, true));
+            if (isSlow) {
+                // deliver the response body byte-by-byte, each byte in its own DATA frame, with the gaps
+                // shorter than the client's read-timeout interval, but the total delivery time spanning
+                // several read-timeout intervals (which the old pipeline layout would wrongly trigger on)
+                final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+                final AtomicInteger remaining = new AtomicInteger(SLOW_RESPONSE.length());
+                for (int i = 0; i < SLOW_RESPONSE.length(); i++) {
+                    final int index = i;
+                    scheduler.schedule(() -> {
+                        final ByteBuf oneByte = Unpooled.wrappedBuffer(
+                                new byte[] {(byte) SLOW_RESPONSE.charAt(index)});
+                        ctx.write(new DefaultHttp2DataFrame(oneByte,
+                                remaining.decrementAndGet() == 0));
+                        ctx.flush();
+                    }, 500L * (i + 1), TimeUnit.MILLISECONDS);
+                }
+                scheduler.shutdown();
+            } else {
+                final ByteBuf content = Unpooled.wrappedBuffer(body.getBytes(StandardCharsets.UTF_8));
+                ctx.write(new DefaultHttp2DataFrame(content, true));
+            }
             ctx.flush();
         }
     }
@@ -177,6 +202,67 @@ public class Http2Test {
             assertThrows(Exception.class, () -> {
                 client.target("http://localhost:" + port + "/helloworld").request().get(String.class);
             });
+        }
+    }
+
+    /**
+     * A peer that accepts the TCP connection but never completes the TLS handshake must fail the request
+     * once the read timeout elapses, instead of waiting for the connect timeout (which is unbounded when unset).
+     */
+    @Test
+    public void testReadTimeoutDuringHttpsHandshake() {
+        // a server that accepts connections but never speaks TLS
+        final NioEventLoopGroup silentGroup = new NioEventLoopGroup(1);
+        Channel silentServer = null;
+        try {
+            final ServerBootstrap silent = new ServerBootstrap();
+            silent.group(silentGroup)
+                  .channel(NioServerSocketChannel.class)
+                  .childHandler(new ChannelInitializer<SocketChannel>() {
+                      @Override
+                      protected void initChannel(SocketChannel ch) {
+                          // no handler: the server never replies to the TLS handshake
+                      }
+                  });
+            silentServer = silent.bind(0).sync().channel();
+            final int silentPort = ((InetSocketAddress) silentServer.localAddress()).getPort();
+
+            final ClientConfig config = new ClientConfig();
+            config.connectorProvider(new NettyConnectorProvider());
+            config.property(NettyClientProperties.ENABLE_HTTP2, Boolean.TRUE);
+            config.property(ClientProperties.READ_TIMEOUT, 1_500);
+            try (Client client = ClientBuilder.newClient(config)) {
+                final long start = System.nanoTime();
+                assertThrows(ProcessingException.class, () -> {
+                    client.target("https://localhost:" + silentPort + "/helloworld")
+                            .request(MediaType.TEXT_PLAIN_TYPE).get(String.class);
+                });
+                final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                // the request must fail because of the read timeout, not hang until the (unbounded) connect timeout
+                assertTrue(elapsedMillis < 15_000,
+                        "The request should fail within seconds, but took " + elapsedMillis + " ms");
+            }
+        } finally {
+            if (silentServer != null) {
+                silentServer.close();
+            }
+            silentGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * The read timeout is an inactivity timeout: an HTTP/2 response whose DATA frames keep arriving over
+     * more than one read-timeout interval (but with no gap ever exceeding the timeout) must not time out.
+     */
+    @Test
+    public void testReadTimeoutNotTriggeredByProgressingHttp2Response() {
+        try (Client client = http2Client()) {
+            client.property(ClientProperties.READ_TIMEOUT, 2_000);
+            try (Response response = client.target("http://localhost:" + port + "/slow")
+                    .request(MediaType.TEXT_PLAIN_TYPE).get()) {
+                assertEquals(200, response.getStatus());
+                assertEquals(SLOW_RESPONSE, response.readEntity(String.class));
+            }
         }
     }
 }
