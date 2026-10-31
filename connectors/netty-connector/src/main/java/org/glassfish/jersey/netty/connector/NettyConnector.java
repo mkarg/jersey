@@ -211,16 +211,12 @@ class NettyConnector implements Connector {
             final String key = requestConfiguration
                                 .connectionController()
                                 .getConnectionGroup(jerseyRequest, requestUri, sslConfig.getSNIHostName(), port);
-            // the pool has to be partitioned by the effective HTTP/2 settings of the request, because the protocol
-            // and the content aggregation limit are fixed when the connection is established
-            final String pooledConnectionKey = (enableHttp2 ? "|http2:" + requestConfiguration.maxHttp2ContentLength.get() : "")
-                            + key;
             ArrayList<Channel> conns;
             synchronized (connections) {
-               conns = connections.get(pooledConnectionKey);
+               conns = connections.get(buildPoolKey(key, enableHttp2, requestConfiguration));
                if (conns == null) {
                   conns = new ArrayList<>(0);
-                  connections.put(pooledConnectionKey, conns);
+                  connections.put(buildPoolKey(key, enableHttp2, requestConfiguration), conns);
                }
             }
 
@@ -453,14 +449,15 @@ class NettyConnector implements Connector {
                if (th == null) {
                   ch.pipeline().addLast(INACTIVE_POOLED_CONNECTION_HANDLER,
                           new IdleStateHandler(0, 0, requestConfiguration.maxPoolIdle.get()));
-                  ch.pipeline().addLast(PRUNE_INACTIVE_POOL, new PruneIdlePool(connections, pooledConnectionKey));
+                  ch.pipeline().addLast(PRUNE_INACTIVE_POOL,
+                          new PruneIdlePool(connections, buildPoolKey(key, enableHttp2, requestConfiguration)));
                   boolean added = true;
                   synchronized (connections) {
-                     ArrayList<Channel> conns1 = connections.get(pooledConnectionKey);
+                     ArrayList<Channel> conns1 = connections.get(buildPoolKey(key, enableHttp2, requestConfiguration));
                      if (conns1 == null) {
                         conns1 = new ArrayList<>(1);
                         conns1.add(ch);
-                        connections.put(pooledConnectionKey, conns1);
+                        connections.put(buildPoolKey(key, enableHttp2, requestConfiguration), conns1);
                      } else {
                         synchronized (conns1) {
                            if ((requestConfiguration.maxPoolSizeTotal.get() == 0
@@ -672,6 +669,16 @@ class NettyConnector implements Connector {
                 .initialSettings(new Http2Settings().pushEnabled(false))
                 .httpScheme("https".equals(requestUri.getScheme()) ? HttpScheme.HTTPS : HttpScheme.HTTP)
                 .build();
+    }
+
+    /**
+     * The connection pool has to be partitioned by the effective HTTP/2 settings of the request, because the
+     * protocol and the content aggregation limit are fixed when the connection is established, so a request
+     * with different settings must not reuse a connection negotiated for the previous settings.
+     */
+    private static String buildPoolKey(String connectionGroup, boolean enableHttp2,
+            NettyConnectorProvider.Config.RW requestConfiguration) {
+        return (enableHttp2 ? "|http2:" + requestConfiguration.maxHttp2ContentLength.get() : "") + connectionGroup;
     }
 
     private String buildPathWithQueryParameters(URI requestUri) {
