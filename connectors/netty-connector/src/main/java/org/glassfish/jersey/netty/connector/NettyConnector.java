@@ -44,6 +44,7 @@ import jakarta.ws.rs.client.Client;
 import jakarta.ws.rs.core.Configuration;
 
 import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
