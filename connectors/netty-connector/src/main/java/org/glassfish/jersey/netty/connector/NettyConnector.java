@@ -208,6 +208,11 @@ class NettyConnector implements Connector {
             final SSLParamConfigurator sslConfig = SSLParamConfigurator.builder(requestConfiguration)
                     .request(jerseyRequest).setSNIAlways(true).setSNIHostName(jerseyRequest).build();
 
+            final boolean isHttps = "https".equals(requestUri.getScheme());
+            final boolean enableHttp2 = Boolean.TRUE.equals(requestConfiguration.enableHttp2.get())
+                    // the HTTP/2 is not supported through the HTTP proxy
+                    && !requestConfiguration.proxy(jerseyRequest, requestUri).isPresent();
+
             final String key = requestConfiguration
                                 .connectionController()
                                 .getConnectionGroup(jerseyRequest, requestUri, sslConfig.getSNIHostName(), port);
@@ -248,11 +253,6 @@ class NettyConnector implements Connector {
                     pooledExpect100ContinueHandler == null
                             ? new JerseyExpectContinueHandler()
                             : pooledExpect100ContinueHandler;
-
-            final boolean isHttps = "https".equals(requestUri.getScheme());
-            final boolean enableHttp2 = Boolean.TRUE.equals(requestConfiguration.enableHttp2.get())
-                    // the HTTP/2 is not supported through the HTTP proxy
-                    && !requestConfiguration.proxy(jerseyRequest, requestUri).isPresent();
 
             final boolean isNewChannel = chan == null;
 
