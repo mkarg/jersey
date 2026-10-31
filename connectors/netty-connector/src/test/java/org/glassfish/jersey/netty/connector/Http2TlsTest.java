@@ -31,6 +31,7 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.nio.NioEventLoopGroup;
@@ -99,7 +100,7 @@ public class Http2TlsTest {
      * Starts a TLS server with the given connection handler. When {@code withH2} is set, the server
      * advertises the HTTP/2 application protocol in the ALPN, otherwise it offers HTTP/1.1 only.
      */
-    private Channel httpsServer(Object http2Handler, boolean withH2) throws Exception {
+    private Channel httpsServer(ChannelHandler http2Handler, boolean withH2) throws Exception {
         final SelfSignedCertificate certificate = new SelfSignedCertificate();
         SslContext sslContext;
         if (withH2) {
