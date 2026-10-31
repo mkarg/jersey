@@ -31,6 +31,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -43,9 +44,11 @@ import jakarta.ws.rs.client.Client;
 import jakarta.ws.rs.core.Configuration;
 
 import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
@@ -56,17 +59,32 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.DefaultHttpRequest;
 import io.netty.handler.codec.http.HttpChunkedInput;
+import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.handler.codec.http.HttpContentDecompressor;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpScheme;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
+import io.netty.handler.codec.http2.DefaultHttp2Connection;
+import io.netty.handler.codec.http2.DelegatingDecompressorFrameListener;
+import io.netty.handler.codec.http2.Http2Connection;
+import io.netty.handler.codec.http2.Http2Exception;
+import io.netty.handler.codec.http2.Http2FrameListener;
+import io.netty.handler.codec.http2.Http2FrameListenerDecorator;
+import io.netty.handler.codec.http2.Http2Headers;
+import io.netty.handler.codec.http2.Http2Settings;
+import io.netty.handler.codec.http2.HttpToHttp2ConnectionHandler;
+import io.netty.handler.codec.http2.HttpToHttp2ConnectionHandlerBuilder;
+import io.netty.handler.codec.http2.InboundHttp2ToHttpAdapterBuilder;
+import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.handler.logging.LogLevel;
 import io.netty.handler.logging.LoggingHandler;
 import io.netty.handler.ssl.ApplicationProtocolConfig;
+import io.netty.handler.ssl.ApplicationProtocolNegotiationHandler;
 import io.netty.handler.ssl.ClientAuth;
 import io.netty.handler.ssl.IdentityCipherSuiteFilter;
 import io.netty.handler.ssl.JdkSslContext;
@@ -75,6 +93,7 @@ import io.netty.handler.stream.ChunkedWriteHandler;
 import io.netty.handler.timeout.IdleState;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
+import io.netty.handler.timeout.ReadTimeoutException;
 import io.netty.resolver.NoopAddressResolverGroup;
 import io.netty.util.concurrent.GenericFutureListener;
 import org.glassfish.jersey.client.ClientRequest;
@@ -117,6 +136,7 @@ class NettyConnector implements Connector {
     static final String INACTIVE_POOLED_CONNECTION_HANDLER = "inactive_pooled_connection_handler";
     private static final String PRUNE_INACTIVE_POOL = "prune_inactive_pool";
     private static final String READ_TIMEOUT_HANDLER = "read_timeout_handler";
+    private static final String ALPN_IDLE_HANDLER = "alpn_idle_handler";
     private static final String REQUEST_HANDLER = "request_handler";
     private static final String EXPECT_100_CONTINUE_HANDLER = "expect_100_continue_handler";
 
@@ -172,6 +192,8 @@ class NettyConnector implements Connector {
         final NettyConnectorProvider.Config.RW requestConfiguration =
                 clientConfiguration
                         .fromRequest(jerseyRequest)
+                        .enableHttp2(jerseyRequest)
+                        .maxHttp2ContentLength(jerseyRequest)
                         .readTimeout(jerseyRequest)
                         .expect100ContinueTimeout(jerseyRequest);
         final int readTimeout = requestConfiguration.readTimeout();
@@ -191,15 +213,20 @@ class NettyConnector implements Connector {
             final SSLParamConfigurator sslConfig = SSLParamConfigurator.builder(requestConfiguration)
                     .request(jerseyRequest).setSNIAlways(true).setSNIHostName(jerseyRequest).build();
 
+            final boolean isHttps = "https".equals(requestUri.getScheme());
+            final boolean enableHttp2 = Boolean.TRUE.equals(requestConfiguration.enableHttp2.get())
+                    // the HTTP/2 is not supported through the HTTP proxy
+                    && !requestConfiguration.proxy(jerseyRequest, requestUri).isPresent();
+
             final String key = requestConfiguration
                                 .connectionController()
                                 .getConnectionGroup(jerseyRequest, requestUri, sslConfig.getSNIHostName(), port);
             ArrayList<Channel> conns;
             synchronized (connections) {
-               conns = connections.get(key);
+               conns = connections.get(buildPoolKey(key, enableHttp2, requestConfiguration));
                if (conns == null) {
                   conns = new ArrayList<>(0);
-                  connections.put(key, conns);
+                  connections.put(buildPoolKey(key, enableHttp2, requestConfiguration), conns);
                }
             }
 
@@ -232,6 +259,11 @@ class NettyConnector implements Connector {
                             ? new JerseyExpectContinueHandler()
                             : pooledExpect100ContinueHandler;
 
+            final boolean isNewChannel = chan == null;
+
+            // completes when the negotiated protocol of the new HTTPS connection is known
+            final CompletableFuture<Boolean> http2Negotiated = new CompletableFuture<>();
+
             if (chan == null) {
                requestConfiguration.connectTimeout(jerseyRequest);
                Bootstrap b = new Bootstrap();
@@ -257,14 +289,22 @@ class NettyConnector implements Connector {
                      });
 
                      // Enable HTTPS if necessary.
-                     if ("https".equals(requestUri.getScheme())) {
+                     if (isHttps) {
+                         ApplicationProtocolConfig alpnConfig = enableHttp2
+                                 ? new ApplicationProtocolConfig(ApplicationProtocolConfig.Protocol.ALPN,
+                                         ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                                         ApplicationProtocolNames.HTTP_2,
+                                         ApplicationProtocolNames.HTTP_1_1)
+                                 : null;
+
                          // making client authentication optional for now; it could be extracted to configurable property
                          JdkSslContext jdkSslContext = new JdkSslContext(
                                  requestConfiguration.sslContext(client, jerseyRequest),
                                  true,
                                  (Iterable) null,
                                  IdentityCipherSuiteFilter.INSTANCE,
-                                 (ApplicationProtocolConfig) null,
+                                 alpnConfig,
                                  ClientAuth.NONE,
                                  (String[]) null, /* enable default protocols */
                                  false /* true if the first write request shouldn't be encrypted */
@@ -282,15 +322,78 @@ class NettyConnector implements Connector {
                          sslConfig.setSNIServerName(sslHandler.engine());
 
                          p.addLast(sslHandler);
+
+                         if (enableHttp2) {
+                             // the read-timeout protection has to cover the ALPN negotiation too:
+                             // a peer that accepts the TCP connection but never completes the TLS/ALPN
+                             // handshake would otherwise only hit the connect-timeout (if set at all)
+                             if (requestConfiguration.readTimeout() > 0) {
+                                 p.addLast(READ_TIMEOUT_HANDLER,
+                                         new IdleStateHandler(0, 0, requestConfiguration.readTimeout(), TimeUnit.MILLISECONDS));
+                                 p.addLast(ALPN_IDLE_HANDLER, new ChannelInboundHandlerAdapter() {
+                                     @Override
+                                     public void userEventTriggered(final ChannelHandlerContext ctx, final Object evt) {
+                                         if (evt instanceof IdleStateEvent) {
+                                             http2Negotiated.completeExceptionally(new ReadTimeoutException());
+                                             ctx.close();
+                                         } else {
+                                             ctx.fireUserEventTriggered(evt);
+                                         }
+                                     }
+                                 });
+                             }
+                             // the connection handlers are installed once the negotiated protocol is known
+                             p.addLast(new ApplicationProtocolNegotiationHandler(ApplicationProtocolNames.HTTP_1_1) {
+                                 @Override
+                                 protected void configurePipeline(ChannelHandlerContext ctx, String protocol) {
+                                     try {
+                                         // the negotiation is done: the ordinary read-timeout protection
+                                         // takes over once the request is sent
+                                         removePipelineHandlers(p, READ_TIMEOUT_HANDLER, ALPN_IDLE_HANDLER);
+                                         if (requestConfiguration.loggingEnabled.get()) {
+                                             // the early return above skips the common LoggingHandler installation
+                                             p.addLast(new LoggingHandler(LogLevel.INFO));
+                                         }
+                                         if (ApplicationProtocolNames.HTTP_2.equals(protocol)) {
+                                             p.addLast(createHttp2ConnectionHandler(requestConfiguration,
+                                                     requestUri, responseDone));
+                                             p.addLast(new ChunkedWriteHandler());
+                                             http2Negotiated.complete(Boolean.TRUE);
+                                         } else {
+                                             addHttp1Handlers(p, config, requestConfiguration, expect100ContinueHandler);
+                                             http2Negotiated.complete(Boolean.FALSE);
+                                         }
+                                     } catch (RuntimeException | Error e) {
+                                         // the pipeline construction failed: do not leave the caller waiting
+                                         // for the connect timeout, but fail the negotiation immediately
+                                         http2Negotiated.completeExceptionally(e);
+                                         ctx.close();
+                                     }
+                                 }
+
+                                 @Override
+                                 protected void handshakeFailure(ChannelHandlerContext ctx, Throwable cause) {
+                                     removePipelineHandlers(p, READ_TIMEOUT_HANDLER, ALPN_IDLE_HANDLER);
+                                     http2Negotiated.completeExceptionally(cause);
+                                 }
+                             });
+                             return;
+                         }
                      }
 
                      if (requestConfiguration.loggingEnabled.get()) {
                          p.addLast(new LoggingHandler(LogLevel.INFO));
                      }
-                     p.addLast(requestConfiguration.createHttpClientCodec(config.getProperties()));
-                     p.addLast(EXPECT_100_CONTINUE_HANDLER, expect100ContinueHandler);
-                     p.addLast(new ChunkedWriteHandler());
-                     p.addLast(new HttpContentDecompressor());
+
+                     if (enableHttp2) {
+                         // the cleartext HTTP/2 (h2c) prior knowledge: the HTTP/2 preface is sent directly
+                         p.addLast(createHttp2ConnectionHandler(requestConfiguration, requestUri, responseDone));
+                         p.addLast(new ChunkedWriteHandler());
+                         http2Negotiated.complete(Boolean.TRUE);
+                     } else {
+                         addHttp1Handlers(p, config, requestConfiguration, expect100ContinueHandler);
+                         http2Negotiated.complete(Boolean.FALSE);
+                     }
                     }
                 });
 
@@ -318,9 +421,35 @@ class NettyConnector implements Connector {
             JerseyClientHandler clientHandler = new JerseyClientHandler(
                     jerseyRequest, responseAvailable, responseDone, redirectUriHistory, this, requestConfiguration);
 
+            // on a new HTTPS connection with the HTTP/2 enabled, wait for the ALPN result before the request
+            // is written (the connection handlers must be installed first)
+            final boolean isHttp2;
+            if (isNewChannel && isHttps && enableHttp2) {
+                try {
+                    isHttp2 = http2Negotiated.get(requestConfiguration.connectTimeout() > 0
+                            ? requestConfiguration.connectTimeout() : Integer.MAX_VALUE, TimeUnit.MILLISECONDS);
+                } catch (ExecutionException | TimeoutException | InterruptedException e) {
+                    ch.close();
+                    responseAvailable.completeExceptionally(
+                            new ProcessingException(LocalizationMessages.HTTP_2_NEGOTIATION_FAILED(e.getCause()), e));
+                    return;
+                }
+            } else {
+                // pooled channel, cleartext, or a channel with the protocol already known
+                isHttp2 = ch.pipeline().get(HttpToHttp2ConnectionHandler.class) != null;
+            }
+
             // read timeout makes sense really as an inactivity timeout
-            ch.pipeline().addLast(READ_TIMEOUT_HANDLER,
-                                  new IdleStateHandler(0, 0, requestConfiguration.readTimeout(), TimeUnit.MILLISECONDS));
+            if (isHttp2) {
+                // the inactivity timer has to see the incoming HTTP/2 frames, including the DATA frames that the
+                // inbound adapter buffers until the END_STREAM: hence the timer is installed before the HTTP/2
+                // connection handler, at the head of the pipeline
+                ch.pipeline().addFirst(READ_TIMEOUT_HANDLER,
+                        new IdleStateHandler(0, 0, requestConfiguration.readTimeout(), TimeUnit.MILLISECONDS));
+            } else {
+                ch.pipeline().addLast(READ_TIMEOUT_HANDLER,
+                        new IdleStateHandler(0, 0, requestConfiguration.readTimeout(), TimeUnit.MILLISECONDS));
+            }
             ch.pipeline().addLast(REQUEST_HANDLER, clientHandler);
 
             responseDone.whenComplete((_r, th) -> {
@@ -330,14 +459,15 @@ class NettyConnector implements Connector {
                if (th == null) {
                   ch.pipeline().addLast(INACTIVE_POOLED_CONNECTION_HANDLER,
                           new IdleStateHandler(0, 0, requestConfiguration.maxPoolIdle.get()));
-                  ch.pipeline().addLast(PRUNE_INACTIVE_POOL, new PruneIdlePool(connections, key));
+                  ch.pipeline().addLast(PRUNE_INACTIVE_POOL,
+                          new PruneIdlePool(connections, buildPoolKey(key, enableHttp2, requestConfiguration)));
                   boolean added = true;
                   synchronized (connections) {
-                     ArrayList<Channel> conns1 = connections.get(key);
+                     ArrayList<Channel> conns1 = connections.get(buildPoolKey(key, enableHttp2, requestConfiguration));
                      if (conns1 == null) {
                         conns1 = new ArrayList<>(1);
                         conns1.add(ch);
-                        connections.put(key, conns1);
+                        connections.put(buildPoolKey(key, enableHttp2, requestConfiguration), conns1);
                      } else {
                         synchronized (conns1) {
                            if ((requestConfiguration.maxPoolSizeTotal.get() == 0
@@ -454,9 +584,11 @@ class NettyConnector implements Connector {
                 });
 
                 headersSet.await();
-                new Expect100ContinueConnectorExtension(requestConfiguration).invoke(jerseyRequest, nettyRequest);
+                if (!isHttp2) {
+                    new Expect100ContinueConnectorExtension(requestConfiguration).invoke(jerseyRequest, nettyRequest);
+                }
 
-                boolean continueExpected = HttpUtil.is100ContinueExpected(nettyRequest);
+                boolean continueExpected = !isHttp2 && HttpUtil.is100ContinueExpected(nettyRequest);
                 boolean expectationsFailed  = false;
 
                 if (continueExpected) {
@@ -507,6 +639,100 @@ class NettyConnector implements Connector {
             ClientRequest clientRequest, Channel channel, NettyConnectorProvider.Config.RW requestConfiguration) {
         return NettyEntityWriter
                 .getInstance(clientRequest, channel, () -> requestConfiguration.requestEntityProcessing(clientRequest));
+    }
+
+    private static void addHttp1Handlers(ChannelPipeline p, Configuration config,
+            NettyConnectorProvider.Config.RW requestConfiguration, JerseyExpectContinueHandler expect100ContinueHandler) {
+        p.addLast(requestConfiguration.createHttpClientCodec(config.getProperties()));
+        p.addLast(EXPECT_100_CONTINUE_HANDLER, expect100ContinueHandler);
+        p.addLast(new ChunkedWriteHandler());
+        p.addLast(new HttpContentDecompressor());
+    }
+
+    /**
+     * Best-effort removal of the temporary negotiation handlers; the handlers may already
+     * have been removed or the pipeline may already be torn down.
+     */
+    private static void removePipelineHandlers(ChannelPipeline p, String... handlerNames) {
+        for (String handlerName : handlerNames) {
+            try {
+                p.remove(handlerName);
+            } catch (NoSuchElementException e) {
+                // already removed
+            }
+        }
+    }
+
+    private static HttpToHttp2ConnectionHandler createHttp2ConnectionHandler(
+            NettyConnectorProvider.Config.RW requestConfiguration, URI requestUri, CompletableFuture<?> responseDone) {
+        Http2Connection connection = new DefaultHttp2Connection(false);
+        // the HTTP/2 connection handler turns a stream error (e.g. the content limit exceeded in the inbound
+        // adapter) into RST_STREAM without failing the channel: the Jersey request completion has to be
+        // failed explicitly, or the invocation would wait indefinitely (the default READ_TIMEOUT is unbounded)
+        Http2FrameListener delegatingListener = new DelegatingDecompressorFrameListener(
+                connection,
+                new InboundHttp2ToHttpAdapterBuilder(connection)
+                        .maxContentLength(requestConfiguration.maxHttp2ContentLength.get())
+                        .propagateSettings(true)
+                        .build());
+        Http2FrameListener listener = new Http2FrameListenerDecorator(delegatingListener) {
+            @Override
+            public int onDataRead(final ChannelHandlerContext ctx, final int streamId, final ByteBuf data,
+                    final int padding, final boolean endOfStream) throws Http2Exception {
+                try {
+                    return super.onDataRead(ctx, streamId, data, padding, endOfStream);
+                } catch (Http2Exception e) {
+                    forwardStreamError(ctx, responseDone, e);
+                    throw e;
+                }
+            }
+
+            @Override
+            public void onHeadersRead(final ChannelHandlerContext ctx, final int streamId, final Http2Headers headers,
+                    final int padding, final boolean endStream) throws Http2Exception {
+                try {
+                    super.onHeadersRead(ctx, streamId, headers, padding, endStream);
+                } catch (Http2Exception e) {
+                    forwardStreamError(ctx, responseDone, e);
+                    throw e;
+                }
+            }
+        };
+        return new HttpToHttp2ConnectionHandlerBuilder()
+                .connection(connection)
+                .frameListener(listener)
+                // the server push is not supported: the response routing is per-connection, not per-stream,
+                // so a pushed response could be delivered to the caller instead of the requested response
+                .initialSettings(new Http2Settings().pushEnabled(false))
+                .httpScheme("https".equals(requestUri.getScheme()) ? HttpScheme.HTTPS : HttpScheme.HTTP)
+                .build();
+    }
+
+    /**
+     * Forwards a local HTTP/2 stream error (e.g. the content limit exceeded in the inbound adapter) to the
+     * request completion. The error is fired through the pipeline, so the currently installed
+     * {@link JerseyClientHandler} receives it via its exceptionCaught and fails its own responseDone —
+     * this connection-scoped listener only retains the first request's responseDone, which is already
+     * completed when the channel is reused. The retained future is the fallback for the first request,
+     * for the case the request handler has not been installed yet.
+     */
+    private static void forwardStreamError(final ChannelHandlerContext ctx, CompletableFuture<?> responseDone,
+            Http2Exception e) {
+        if (ctx.pipeline().get(REQUEST_HANDLER) != null) {
+            ctx.fireExceptionCaught(e);
+        } else {
+            responseDone.completeExceptionally(e);
+        }
+    }
+
+    /**
+     * The connection pool has to be partitioned by the effective HTTP/2 settings of the request, because the
+     * protocol and the content aggregation limit are fixed when the connection is established, so a request
+     * with different settings must not reuse a connection negotiated for the previous settings.
+     */
+    private static String buildPoolKey(String connectionGroup, boolean enableHttp2,
+            NettyConnectorProvider.Config.RW requestConfiguration) {
+        return (enableHttp2 ? "|http2:" + requestConfiguration.maxHttp2ContentLength.get() : "") + connectionGroup;
     }
 
     private String buildPathWithQueryParameters(URI requestUri) {

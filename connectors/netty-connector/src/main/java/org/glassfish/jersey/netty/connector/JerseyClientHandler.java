@@ -67,6 +67,25 @@ class JerseyClientHandler extends SimpleChannelInboundHandler<HttpObject> {
     private ClientResponse jerseyResponse;
 
     private boolean readTimedOut;
+    /**
+     * The x-http2-* extension headers the Netty HTTP/2 conversion adds to the converted response
+     * for the internal stream routing: they are protocol-internal and must not leak into the client
+     * response (see {@code HttpConversionUtil.ExtensionHeaderNames}).
+     */
+    private static final Set<String> HTTP2_INTERNAL_HEADERS = Set.of(
+            "x-http2-stream-id",
+            "x-http2-scheme",
+            "x-http2-path",
+            "x-http2-stream-promise-id",
+            "x-http2-stream-dependency-id",
+            "x-http2-stream-weight",
+            "x-http2-protocol");
+
+    /**
+     * Set while an informational response (1xx) was received and the final response is still awaited:
+     * the content terminator of the informational response must be ignored too.
+     */
+    private boolean awaitingFinalResponse;
 
     JerseyClientHandler(ClientRequest request, CompletableFuture<ClientResponse> responseAvailable,
                         CompletableFuture<?> responseDone, Set<URI> redirectUriHistory, NettyConnector connector,
@@ -182,6 +201,14 @@ class JerseyClientHandler extends SimpleChannelInboundHandler<HttpObject> {
         }
         if (msg instanceof HttpResponse) {
             final HttpResponse response = (HttpResponse) msg;
+            if (response.status().code() >= 100 && response.status().code() < 200) {
+                // an informational response (e.g. 100 Continue or 103 Early Hints) only precedes the final
+                // response: it must not complete the request, the final response is awaited instead
+                awaitingFinalResponse = true;
+                return;
+            }
+            // the final response arrived: the informational response and its content terminator are done
+            awaitingFinalResponse = false;
             jerseyResponse = new ClientResponse(new Response.StatusType() {
                 @Override
                 public int getStatusCode() {
@@ -200,7 +227,13 @@ class JerseyClientHandler extends SimpleChannelInboundHandler<HttpObject> {
             }, jerseyRequest);
 
             for (Map.Entry<String, String> entry : response.headers().entries()) {
-                jerseyResponse.getHeaders().add(entry.getKey(), entry.getValue());
+                // the Netty HTTP/2 conversion adds the internal x-http2-* extension headers
+                // (stream id, weight, ...) to the converted response: they are protocol-internal
+                // routing details and must not leak into the client response. Only the known internal
+                // names are filtered, so a server-provided header starting with x-http2- is kept.
+                if (!HTTP2_INTERNAL_HEADERS.contains(entry.getKey().toLowerCase())) {
+                    jerseyResponse.getHeaders().add(entry.getKey(), entry.getValue());
+                }
             }
 
             // request entity handling.
@@ -210,6 +243,12 @@ class JerseyClientHandler extends SimpleChannelInboundHandler<HttpObject> {
             jerseyResponse.setEntityStream(nis);
         }
         if (msg instanceof HttpContent) {
+
+            if (awaitingFinalResponse) {
+                // the content terminator of the informational response (a 1xx response carries an empty
+                // LastHttpContent in the HTTP/1.1 decoding) must not complete the request either
+                return;
+            }
 
             HttpContent httpContent = (HttpContent) msg;
 

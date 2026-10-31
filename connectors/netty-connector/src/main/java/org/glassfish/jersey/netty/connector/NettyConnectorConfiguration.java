@@ -36,6 +36,7 @@ import java.util.Map;
 class NettyConnectorConfiguration<N extends NettyConnectorConfiguration<N>> extends ConnectorConfiguration<N> {
 
     /* package */ final NullableRef<NettyConnectionController> connectionController = NullableRef.empty();
+    /* package */ final Ref<Boolean> enableHttp2 = NullableRef.empty();
     /* package */ final NullableRef<Boolean> enableHostnameVerification = NullableRef.empty();
     /* package */ final Ref<Integer> expect100ContTimeout = NullableRef.empty();
     /* package */ final NullableRef<Boolean> filterHeadersForProxy = NullableRef.empty();
@@ -52,6 +53,7 @@ class NettyConnectorConfiguration<N extends NettyConnectorConfiguration<N>> exte
     /* package */ final Ref<Integer> maxRedirects = NullableRef.empty();
     /* package */ final NullableRef<Boolean> preserveMethodOnRedirect = NullableRef.empty();
     /* package */ final NullableRef<NettyHttpRedirectController> redirectController = NullableRef.empty();
+    /* package */ final Ref<Integer> maxHttp2ContentLength = NullableRef.empty();
 
     // If HTTP keepalive is enabled the value of "http.maxConnections" determines the maximum number
     // of idle connections that will be simultaneously kept alive, per destination.
@@ -88,6 +90,31 @@ class NettyConnectorConfiguration<N extends NettyConnectorConfiguration<N>> exte
      */
     public N expect100ContinueTimeout(int millis) {
         expect100ContTimeout.set(millis);
+        return self();
+    }
+
+    /**
+     * Enable or disable the HTTP/2 protocol. The property {@link NettyClientProperties#ENABLE_HTTP2} has precedence
+     * over this setting. The HTTP/2 is enabled either by the ALPN (for the HTTPS uri scheme) or by the HTTP/2
+     * prior knowledge (the cleartext HTTP/2, i.e. h2c).
+     *
+     * @param enable enable or disable the HTTP/2 protocol.
+     * @return updated configuration.
+     */
+    public N enableHttp2(boolean enable) {
+        enableHttp2.set(enable);
+        return self();
+    }
+
+    /**
+     * Set the maximal length of the content of the HTTP/2 response aggregated by the Netty connector.
+     * The property {@link NettyClientProperties#MAX_HTTP2_CONTENT_LENGTH} has precedence over this setting.
+     *
+     * @param length the maximal content length.
+     * @return updated configuration.
+     */
+    public N maxHttp2ContentLength(int length) {
+        maxHttp2ContentLength.set(length);
         return self();
     }
 
@@ -254,7 +281,9 @@ class NettyConnectorConfiguration<N extends NettyConnectorConfiguration<N>> exte
             this.connectionController.setNonEmpty(other.connectionController);
             this.redirectController.setNonEmpty(other.redirectController);
             this.connectionController.setNonEmpty(other.connectionController);
+            ((NullableRef<Boolean>) this.enableHttp2).setNonEmpty((NullableRef<Boolean>) other.enableHttp2);
             this.enableHostnameVerification.setNonEmpty(other.enableHostnameVerification);
+            ((NullableRef<Integer>) this.maxHttp2ContentLength).setNonEmpty((NullableRef<Integer>) other.maxHttp2ContentLength);
             ((NullableRef<Integer>) this.expect100ContTimeout).setNonEmpty((NullableRef<Integer>) other.expect100ContTimeout);
             this.filterHeadersForProxy.setNonEmpty(other.filterHeadersForProxy);
             this.firstHttpHeaderLineLength.setNonEmpty(other.firstHttpHeaderLineLength);
@@ -272,6 +301,7 @@ class NettyConnectorConfiguration<N extends NettyConnectorConfiguration<N>> exte
         @Override
         public N init() {
             Read.super.init();
+            enableHttp2(Boolean.FALSE);
             enableSslHostnameVerification(Boolean.TRUE);
             expect100ContinueTimeout(NettyClientProperties.DEFAULT_EXPECT_100_CONTINUE_TIMEOUT_VALUE);
             filterHeadersForProxy(Boolean.TRUE);
@@ -279,6 +309,7 @@ class NettyConnectorConfiguration<N extends NettyConnectorConfiguration<N>> exte
             enableLoggingHandler(Boolean.FALSE);
             maxChunkSize(NettyClientProperties.DEFAULT_CHUNK_SIZE);
             maxHeaderSize(NettyClientProperties.DEFAULT_HEADER_SIZE);
+            maxHttp2ContentLength(NettyClientProperties.DEFAULT_HTTP2_CONTENT_LENGTH_VALUE);
             // either from Jersey config, or default
             maxTotalConnections(DEFAULT_MAX_POOL_SIZE_TOTAL);
             // either from Jersey config, or default
@@ -296,6 +327,29 @@ class NettyConnectorConfiguration<N extends NettyConnectorConfiguration<N>> exte
          */
         /* package */ NettyConnectionController connectionController() {
             return connectionController.isPresent() ? connectionController.get() : new NettyConnectionController();
+        }
+
+        /**
+         * Update the {@link #enableHttp2(boolean)} setting by the HTTP client request properties.
+         *
+         * @param request the HTTP client request.
+         * @return updated configuration.
+         */
+        /* package */ N enableHttp2(ClientRequest request) {
+            enableHttp2.set(request.resolveProperty(prefixed(NettyClientProperties.ENABLE_HTTP2), enableHttp2.get()));
+            return this.self();
+        }
+
+        /**
+         * Update the {@link #maxHttp2ContentLength(int)} setting by the HTTP client request properties.
+         *
+         * @param request the HTTP client request.
+         * @return updated configuration.
+         */
+        /* package */ N maxHttp2ContentLength(ClientRequest request) {
+            maxHttp2ContentLength.set(request.resolveProperty(
+                    prefixed(NettyClientProperties.MAX_HTTP2_CONTENT_LENGTH), maxHttp2ContentLength.get()));
+            return this.self();
         }
 
         /**
