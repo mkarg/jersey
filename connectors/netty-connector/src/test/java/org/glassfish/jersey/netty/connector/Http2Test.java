@@ -88,6 +88,7 @@ public class Http2Test {
              @Override
              protected void initChannel(SocketChannel ch) {
                  acceptedConnections.incrementAndGet();
+                 ch.attr(SERVER_PORT).set(port);
                  ch.pipeline().addLast(
                          Http2FrameCodecBuilder.forServer().build(),
                          new Http2MultiplexHandler(new Http2ServerStreamHandler()));
@@ -104,6 +105,10 @@ public class Http2Test {
         }
         serverGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS);
     }
+
+    /** The server port, so the stream handler can compose absolute redirect locations. */
+    private static final io.netty.util.AttributeKey<Integer> SERVER_PORT =
+            io.netty.util.AttributeKey.valueOf("serverPort");
 
     /** Remembers the request headers of the HTTP/2 stream (the stream handler is shared). */
     private static final io.netty.util.AttributeKey<Http2Headers> STREAM_REQUEST_HEADERS =
@@ -153,6 +158,8 @@ public class Http2Test {
             final boolean isInformational = String.valueOf(headers.path()).contains("/informational");
             final boolean isSmall = String.valueOf(headers.path()).contains("/small");
             final boolean isGoAway = String.valueOf(headers.path()).contains("/goaway");
+            final boolean isRedirect = String.valueOf(headers.path()).contains("/redirect");
+            final boolean isLarge = String.valueOf(headers.path()).contains("/large");
 
             if (isInformational) {
                 // the final response is preceded by an informational (103 Early Hints) response
@@ -161,6 +168,17 @@ public class Http2Test {
                         .set("x-early-hints", "yes");
                 ctx.write(new DefaultHttp2HeadersFrame(earlyHints, false));
                 ctx.flush();
+            }
+
+            if (isRedirect) {
+                // the final response is a redirect to the plain resource
+                final Http2Headers redirect = new DefaultHttp2Headers()
+                        .status("302")
+                        .set(HttpHeaderNames.LOCATION,
+                                "http://localhost:"
+                                + ctx.channel().parent().attr(SERVER_PORT).get() + "/helloworld");
+                ctx.writeAndFlush(new DefaultHttp2HeadersFrame(redirect, true));
+                return;
             }
 
             final Http2Headers response = new DefaultHttp2Headers()
@@ -186,6 +204,23 @@ public class Http2Test {
                     }, 500L * (i + 1), TimeUnit.MILLISECONDS);
                 }
                 scheduler.shutdown();
+            } else if (isLarge) {
+                // a multi-MB response, streamed in chunks: exercises the HTTP/2 flow control
+                // (the initial window is much smaller than the body, so the server has to wait
+                // for the WINDOW_UPDATE frames from the client while writing)
+                final int total = 5 * 1024 * 1024;
+                final byte[] chunk = new byte[16 * 1024];
+                java.util.Arrays.fill(chunk, (byte) 'a');
+                int written = 0;
+                while (written < total) {
+                    final int remaining = total - written;
+                    final boolean end = remaining <= chunk.length;
+                    final int length = Math.min(remaining, chunk.length);
+                    final ByteBuf content = Unpooled.wrappedBuffer(chunk, 0, length);
+                    ctx.write(new DefaultHttp2DataFrame(content, end));
+                    written += length;
+                }
+                ctx.flush();
             } else {
                 // echo the collected request payload (verifies the entity writing over the HTTP/2
                 // pipeline), or answer with the fixed body otherwise
@@ -249,6 +284,63 @@ public class Http2Test {
             }
             // the server has closed the connection: the connector must reconnect transparently
             try (Response response = client.target("http://localhost:" + port + "/helloworld")
+                    .request(MediaType.TEXT_PLAIN_TYPE).get()) {
+                assertEquals(200, response.getStatus());
+                assertEquals(GET_RESPONSE, response.readEntity(String.class));
+            }
+        }
+    }
+
+    /**
+     * A large response (several MB, far above the HTTP/2 flow control window and above the frame
+     * size) must be delivered completely: the DATA frames are subject to the HTTP/2 flow control,
+     * so this exercises the WINDOW_UPDATE path and the aggregation up to END_STREAM.
+     */
+    @Test
+    public void testLargeResponseFlowControl() {
+        final int size = 5 * 1024 * 1024;
+        final StringBuilder expected = new StringBuilder(size);
+        for (int i = 0; i < size; i++) {
+            expected.append('a');
+        }
+        try (Client client = http2Client()) {
+            try (Response response = client.target("http://localhost:" + port + "/large")
+                    .request(MediaType.TEXT_PLAIN_TYPE).get()) {
+                assertEquals(200, response.getStatus());
+                assertEquals(expected.toString(), response.readEntity(String.class));
+            }
+        }
+    }
+
+    /**
+     * A large request entity (several MB) must be written completely over the HTTP/2 pipeline and
+     * echoed back by the server.
+     */
+    @Test
+    public void testLargePostEntity() {
+        final int size = 2 * 1024 * 1024;
+        final StringBuilder payload = new StringBuilder(size);
+        for (int i = 0; i < size; i++) {
+            payload.append('b');
+        }
+        try (Client client = http2Client()) {
+            try (Response response = client.target("http://localhost:" + port + "/helloworld")
+                    .request(MediaType.TEXT_PLAIN_TYPE)
+                    .post(Entity.entity(payload.toString(), MediaType.TEXT_PLAIN_TYPE))) {
+                assertEquals(200, response.getStatus());
+                final String echoed = response.readEntity(String.class);
+                assertEquals("echo:" + payload, echoed);
+            }
+        }
+    }
+
+    /**
+     * A redirect (302) over HTTP/2 must be followed to the plain resource, over the same connection.
+     */
+    @Test
+    public void testRedirectHttp2() {
+        try (Client client = http2Client()) {
+            try (Response response = client.target("http://localhost:" + port + "/redirect")
                     .request(MediaType.TEXT_PLAIN_TYPE).get()) {
                 assertEquals(200, response.getStatus());
                 assertEquals(GET_RESPONSE, response.readEntity(String.class));
