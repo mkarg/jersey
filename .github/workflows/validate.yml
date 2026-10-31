@@ -36,9 +36,11 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: maven
       - name: Set up Maven ${{ env.MAVEN_VERSION }}
-        uses: stCarolas/setup-maven@v1
-        with:
-          maven-version: ${{ env.MAVEN_VERSION }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/maven"
+          curl -sSfL https://archive.apache.org/dist/maven/maven-3/${{ env.MAVEN_VERSION }}/binaries/apache-maven-${{ env.MAVEN_VERSION }}-bin.tar.gz \
+            | tar -xz --strip-components=1 -C "$RUNNER_TEMP/maven"
+          echo "$RUNNER_TEMP/maven/bin" >> "$GITHUB_PATH"
       - name: Checkstyle
         run: etc/scripts/checkstyle.sh
       - name: Upload checkstyle info
@@ -59,9 +61,11 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: maven
       - name: Set up Maven ${{ env.MAVEN_VERSION }}
-        uses: stCarolas/setup-maven@v1
-        with:
-          maven-version: ${{ env.MAVEN_VERSION }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/maven"
+          curl -sSfL https://archive.apache.org/dist/maven/maven-3/${{ env.MAVEN_VERSION }}/binaries/apache-maven-${{ env.MAVEN_VERSION }}-bin.tar.gz \
+            | tar -xz --strip-components=1 -C "$RUNNER_TEMP/maven"
+          echo "$RUNNER_TEMP/maven/bin" >> "$GITHUB_PATH"
       - name: Build JDK21+ required modules
         run: mvn -B -U -V clean install -DskipTests -pl :jersey-helidon-connector -am
       - name: Build ApiDocs
@@ -78,8 +82,10 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: maven
       - name: Set up Maven ${{ env.MAVEN_VERSION }}
-        uses: stCarolas/setup-maven@v1
-        with:
-          maven-version: ${{ env.MAVEN_VERSION }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/maven"
+          curl -sSfL https://archive.apache.org/dist/maven/maven-3/${{ env.MAVEN_VERSION }}/binaries/apache-maven-${{ env.MAVEN_VERSION }}-bin.tar.gz \
+            | tar -xz --strip-components=1 -C "$RUNNER_TEMP/maven"
+          echo "$RUNNER_TEMP/maven/bin" >> "$GITHUB_PATH"
       - name: Test archetypes
         run: etc/scripts/test-archetypes.sh
