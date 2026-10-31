@@ -116,7 +116,17 @@ public class Http2Test {
 
             final boolean isPost = "POST".contentEquals(headers.method());
             final boolean isSlow = String.valueOf(headers.path()).contains("/slow");
+            final boolean isInformational = String.valueOf(headers.path()).contains("/informational");
             final String body = isPost ? POST_RESPONSE : isSlow ? SLOW_RESPONSE : GET_RESPONSE;
+
+            if (isInformational) {
+                // the final response is preceded by an informational (103 Early Hints) response
+                final Http2Headers earlyHints = new DefaultHttp2Headers()
+                        .status("103")
+                        .set("x-early-hints", "yes");
+                ctx.write(new DefaultHttp2HeadersFrame(earlyHints, false));
+                ctx.flush();
+            }
 
             final Http2Headers response = new DefaultHttp2Headers()
                     .status("200")
@@ -201,6 +211,38 @@ public class Http2Test {
             // the HTTP/2-only server rejects the plain HTTP/1.1 request; the invocation must not succeed
             assertThrows(Exception.class, () -> {
                 client.target("http://localhost:" + port + "/helloworld").request().get(String.class);
+            });
+        }
+    }
+
+    /**
+     * An informational response (e.g. 100 Continue or 103 Early Hints) preceding the final response
+     * must not complete the request: the caller has to receive the final response only.
+     */
+    @Test
+    public void testInformationalResponsePrecedesFinalResponse() {
+        try (Client client = http2Client()) {
+            try (Response response = client.target("http://localhost:" + port + "/informational")
+                    .request(MediaType.TEXT_PLAIN_TYPE).get()) {
+                assertEquals(200, response.getStatus());
+                assertEquals(GET_RESPONSE, response.readEntity(String.class));
+            }
+        }
+    }
+
+    /**
+     * Exceeding MAX_HTTP2_CONTENT_LENGTH must fail the request instead of leaving it waiting indefinitely.
+     */
+    @Test
+    public void testContentLimitExceededFailsRequest() {
+        final ClientConfig config = new ClientConfig();
+        config.connectorProvider(new NettyConnectorProvider());
+        config.property(NettyClientProperties.ENABLE_HTTP2, Boolean.TRUE);
+        config.property(NettyClientProperties.MAX_HTTP2_CONTENT_LENGTH, 8);
+        try (Client client = ClientBuilder.newClient(config)) {
+            assertThrows(ProcessingException.class, () -> {
+                client.target("http://localhost:" + port + "/helloworld")
+                        .request(MediaType.TEXT_PLAIN_TYPE).get(String.class);
             });
         }
     }

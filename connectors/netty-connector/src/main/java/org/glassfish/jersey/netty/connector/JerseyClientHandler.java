@@ -182,6 +182,11 @@ class JerseyClientHandler extends SimpleChannelInboundHandler<HttpObject> {
         }
         if (msg instanceof HttpResponse) {
             final HttpResponse response = (HttpResponse) msg;
+            if (response.status().code() >= 100 && response.status().code() < 200) {
+                // an informational response (e.g. 100 Continue or 103 Early Hints) only precedes the final
+                // response: it must not complete the request, the final response is awaited instead
+                return;
+            }
             jerseyResponse = new ClientResponse(new Response.StatusType() {
                 @Override
                 public int getStatusCode() {

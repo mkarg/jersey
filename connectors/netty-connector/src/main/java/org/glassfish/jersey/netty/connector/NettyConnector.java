@@ -71,6 +71,10 @@ import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.handler.codec.http2.DefaultHttp2Connection;
 import io.netty.handler.codec.http2.DelegatingDecompressorFrameListener;
 import io.netty.handler.codec.http2.Http2Connection;
+import io.netty.handler.codec.http2.Http2Exception;
+import io.netty.handler.codec.http2.Http2FrameListener;
+import io.netty.handler.codec.http2.Http2FrameListenerDecorator;
+import io.netty.handler.codec.http2.Http2Headers;
 import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.codec.http2.HttpToHttp2ConnectionHandler;
 import io.netty.handler.codec.http2.HttpToHttp2ConnectionHandlerBuilder;
@@ -345,8 +349,13 @@ class NettyConnector implements Connector {
                                          // the negotiation is done: the ordinary read-timeout protection
                                          // takes over once the request is sent
                                          removePipelineHandlers(p, READ_TIMEOUT_HANDLER, ALPN_IDLE_HANDLER);
+                                         if (requestConfiguration.loggingEnabled.get()) {
+                                             // the early return above skips the common LoggingHandler installation
+                                             p.addLast(new LoggingHandler(LogLevel.INFO));
+                                         }
                                          if (ApplicationProtocolNames.HTTP_2.equals(protocol)) {
-                                             p.addLast(createHttp2ConnectionHandler(requestConfiguration, requestUri));
+                                             p.addLast(createHttp2ConnectionHandler(requestConfiguration,
+                                                     requestUri, responseDone));
                                              p.addLast(new ChunkedWriteHandler());
                                              http2Negotiated.complete(Boolean.TRUE);
                                          } else {
@@ -377,7 +386,7 @@ class NettyConnector implements Connector {
 
                      if (enableHttp2) {
                          // the cleartext HTTP/2 (h2c) prior knowledge: the HTTP/2 preface is sent directly
-                         p.addLast(createHttp2ConnectionHandler(requestConfiguration, requestUri));
+                         p.addLast(createHttp2ConnectionHandler(requestConfiguration, requestUri, responseDone));
                          p.addLast(new ChunkedWriteHandler());
                          http2Negotiated.complete(Boolean.TRUE);
                      } else {
@@ -654,16 +663,43 @@ class NettyConnector implements Connector {
     }
 
     private static HttpToHttp2ConnectionHandler createHttp2ConnectionHandler(
-            NettyConnectorProvider.Config.RW requestConfiguration, URI requestUri) {
+            NettyConnectorProvider.Config.RW requestConfiguration, URI requestUri, CompletableFuture<?> responseDone) {
         Http2Connection connection = new DefaultHttp2Connection(false);
+        // the HTTP/2 connection handler turns a stream error (e.g. the content limit exceeded in the inbound
+        // adapter) into RST_STREAM without failing the channel: the Jersey request completion has to be
+        // failed explicitly, or the invocation would wait indefinitely (the default READ_TIMEOUT is unbounded)
+        Http2FrameListener delegatingListener = new DelegatingDecompressorFrameListener(
+                connection,
+                new InboundHttp2ToHttpAdapterBuilder(connection)
+                        .maxContentLength(requestConfiguration.maxHttp2ContentLength.get())
+                        .propagateSettings(true)
+                        .build());
+        Http2FrameListener listener = new Http2FrameListenerDecorator(delegatingListener) {
+            @Override
+            public int onDataRead(final ChannelHandlerContext ctx, final int streamId, final ByteBuf data,
+                    final int padding, final boolean endOfStream) throws Http2Exception {
+                try {
+                    return super.onDataRead(ctx, streamId, data, padding, endOfStream);
+                } catch (Http2Exception e) {
+                    responseDone.completeExceptionally(e);
+                    throw e;
+                }
+            }
+
+            @Override
+            public void onHeadersRead(final ChannelHandlerContext ctx, final int streamId, final Http2Headers headers,
+                    final int padding, final boolean endStream) throws Http2Exception {
+                try {
+                    super.onHeadersRead(ctx, streamId, headers, padding, endStream);
+                } catch (Http2Exception e) {
+                    responseDone.completeExceptionally(e);
+                    throw e;
+                }
+            }
+        };
         return new HttpToHttp2ConnectionHandlerBuilder()
                 .connection(connection)
-                .frameListener(new DelegatingDecompressorFrameListener(
-                        connection,
-                        new InboundHttp2ToHttpAdapterBuilder(connection)
-                                .maxContentLength(requestConfiguration.maxHttp2ContentLength.get())
-                                .propagateSettings(true)
-                                .build()))
+                .frameListener(listener)
                 // the server push is not supported: the response routing is per-connection, not per-stream,
                 // so a pushed response could be delivered to the caller instead of the requested response
                 .initialSettings(new Http2Settings().pushEnabled(false))
