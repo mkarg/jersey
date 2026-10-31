@@ -18,6 +18,9 @@ package org.glassfish.jersey.netty.connector;
 
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -56,6 +59,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -148,6 +152,7 @@ public class Http2Test {
             final boolean isSlow = String.valueOf(headers.path()).contains("/slow");
             final boolean isInformational = String.valueOf(headers.path()).contains("/informational");
             final boolean isSmall = String.valueOf(headers.path()).contains("/small");
+            final boolean isGoAway = String.valueOf(headers.path()).contains("/goaway");
 
             if (isInformational) {
                 // the final response is preceded by an informational (103 Early Hints) response
@@ -190,6 +195,10 @@ public class Http2Test {
                 ctx.write(new DefaultHttp2DataFrame(content, true));
             }
             ctx.flush();
+            if (isGoAway) {
+                // the server announces the shutdown and closes the connection
+                ctx.channel().eventLoop().schedule(() -> ctx.channel().close(), 100, TimeUnit.MILLISECONDS);
+            }
         }
     }
 
@@ -208,6 +217,8 @@ public class Http2Test {
                 assertEquals(200, response.getStatus());
                 assertEquals(GET_RESPONSE, response.readEntity(String.class));
                 assertEquals("GET", response.getHeaderString("x-http2-echo-method"));
+                // the internal HTTP/2 stream routing header must not leak into the client response
+                assertNull(response.getHeaderString("x-http2-stream-id"), "leaked headers: " + response.getHeaders());
             }
         }
     }
@@ -224,6 +235,61 @@ public class Http2Test {
                 assertEquals("POST", response.getHeaderString("x-http2-echo-method"));
             }
         }
+    }
+
+    @Test
+    public void testServerGoAwayAfterResponse() throws Exception {
+        // the first request succeeds, then the server sends GOAWAY (e.g. shutting down) and closes;
+        // the next request must transparently open a new connection instead of hanging or failing silently
+        try (Client client = http2Client()) {
+            try (Response response = client.target("http://localhost:" + port + "/goaway")
+                    .request(MediaType.TEXT_PLAIN_TYPE).get()) {
+                assertEquals(200, response.getStatus());
+                assertEquals(GET_RESPONSE, response.readEntity(String.class));
+            }
+            // the server has closed the connection: the connector must reconnect transparently
+            try (Response response = client.target("http://localhost:" + port + "/helloworld")
+                    .request(MediaType.TEXT_PLAIN_TYPE).get()) {
+                assertEquals(200, response.getStatus());
+                assertEquals(GET_RESPONSE, response.readEntity(String.class));
+            }
+        }
+    }
+
+    @Test
+    public void testConcurrentHttp2RequestsShareConnection() throws Exception {
+        try (Client client = http2Client()) {
+            final List<CompletableFuture<Void>> futures = new ArrayList<>();
+            for (int i = 0; i < 4; i++) {
+                final int index = i;
+                futures.add(CompletableFuture.runAsync(() -> {
+                    try (Response response = client.target("http://localhost:" + port + "/helloworld")
+                            .request(MediaType.TEXT_PLAIN_TYPE).get()) {
+                        assertEquals(200, response.getStatus());
+                        assertEquals(GET_RESPONSE, response.readEntity(String.class));
+                    }
+                }));
+            }
+            for (CompletableFuture<Void> future : futures) {
+                future.get(30, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    public void testPostConnectionReuseHttp2() {
+        try (Client client = http2Client()) {
+            for (int i = 0; i < 3; i++) {
+                try (Response response = client.target("http://localhost:" + port + "/helloworld")
+                        .request(MediaType.TEXT_PLAIN_TYPE)
+                        .post(Entity.entity("payload-" + i, MediaType.TEXT_PLAIN_TYPE))) {
+                    assertEquals(200, response.getStatus());
+                    assertEquals("echo:payload-" + i, response.readEntity(String.class));
+                }
+            }
+        }
+        // all three POSTs must be served over the same pooled connection
+        assertEquals(1, acceptedConnections.get());
     }
 
     @Test
