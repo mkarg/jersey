@@ -682,7 +682,7 @@ class NettyConnector implements Connector {
                 try {
                     return super.onDataRead(ctx, streamId, data, padding, endOfStream);
                 } catch (Http2Exception e) {
-                    responseDone.completeExceptionally(e);
+                    forwardStreamError(ctx, responseDone, e);
                     throw e;
                 }
             }
@@ -693,7 +693,7 @@ class NettyConnector implements Connector {
                 try {
                     super.onHeadersRead(ctx, streamId, headers, padding, endStream);
                 } catch (Http2Exception e) {
-                    responseDone.completeExceptionally(e);
+                    forwardStreamError(ctx, responseDone, e);
                     throw e;
                 }
             }
@@ -706,6 +706,23 @@ class NettyConnector implements Connector {
                 .initialSettings(new Http2Settings().pushEnabled(false))
                 .httpScheme("https".equals(requestUri.getScheme()) ? HttpScheme.HTTPS : HttpScheme.HTTP)
                 .build();
+    }
+
+    /**
+     * Forwards a local HTTP/2 stream error (e.g. the content limit exceeded in the inbound adapter) to the
+     * request completion. The error is fired through the pipeline, so the currently installed
+     * {@link JerseyClientHandler} receives it via its exceptionCaught and fails its own responseDone —
+     * this connection-scoped listener only retains the first request's responseDone, which is already
+     * completed when the channel is reused. The retained future is the fallback for the first request,
+     * for the case the request handler has not been installed yet.
+     */
+    private static void forwardStreamError(final ChannelHandlerContext ctx, CompletableFuture<?> responseDone,
+            Http2Exception e) {
+        if (ctx.pipeline().get(REQUEST_HANDLER) != null) {
+            ctx.fireExceptionCaught(e);
+        } else {
+            responseDone.completeExceptionally(e);
+        }
     }
 
     /**

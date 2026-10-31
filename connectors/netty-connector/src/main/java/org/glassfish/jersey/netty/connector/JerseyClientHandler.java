@@ -67,6 +67,11 @@ class JerseyClientHandler extends SimpleChannelInboundHandler<HttpObject> {
     private ClientResponse jerseyResponse;
 
     private boolean readTimedOut;
+    /**
+     * Set while an informational response (1xx) was received and the final response is still awaited:
+     * the content terminator of the informational response must be ignored too.
+     */
+    private boolean awaitingFinalResponse;
 
     JerseyClientHandler(ClientRequest request, CompletableFuture<ClientResponse> responseAvailable,
                         CompletableFuture<?> responseDone, Set<URI> redirectUriHistory, NettyConnector connector,
@@ -185,8 +190,11 @@ class JerseyClientHandler extends SimpleChannelInboundHandler<HttpObject> {
             if (response.status().code() >= 100 && response.status().code() < 200) {
                 // an informational response (e.g. 100 Continue or 103 Early Hints) only precedes the final
                 // response: it must not complete the request, the final response is awaited instead
+                awaitingFinalResponse = true;
                 return;
             }
+            // the final response arrived: the informational response and its content terminator are done
+            awaitingFinalResponse = false;
             jerseyResponse = new ClientResponse(new Response.StatusType() {
                 @Override
                 public int getStatusCode() {
@@ -215,6 +223,12 @@ class JerseyClientHandler extends SimpleChannelInboundHandler<HttpObject> {
             jerseyResponse.setEntityStream(nis);
         }
         if (msg instanceof HttpContent) {
+
+            if (awaitingFinalResponse) {
+                // the content terminator of the informational response (a 1xx response carries an empty
+                // LastHttpContent in the HTTP/1.1 decoding) must not complete the request either
+                return;
+            }
 
             HttpContent httpContent = (HttpContent) msg;
 
